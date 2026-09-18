@@ -4,7 +4,7 @@ An MCP server that wraps isolated, headless Ghidra static analysis as callable t
 
 I built this because reverse engineering usually means opening a sample in Ghidra or IDA, manually reading disassembly, and cross referencing imports and strings by hand. There's no structured way for an AI agent to participate in that process, since there's no interface between "here's a binary" and "here's what it does." PseudoLens is that interface: an MCP server (Model Context Protocol) that wraps a real Ghidra headless pipeline as a set of tools an agent can call directly, one function at a time rather than getting one giant blob dumped all at once.
 
-The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior. See the worked example below.
+The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior, then recorded that finding as a structured, MITRE ATT&CK-tagged record instead of just leaving it in conversation. See the worked example below.
 
 ## What it does
 
@@ -16,6 +16,7 @@ The core pipeline works end to end. I've run it against a live sample pulled fro
 6. Extracts imported libraries and embedded strings, the fastest signals for identifying malware family and behavior.
 7. Lets you search whatever's already been decompiled for calls to a specific API, useful for questions like "which functions call CreateRemoteThread."
 8. Runs the initial analysis as an async job so a long running task doesn't block the calling agent. `run_static_analysis` returns a job ID right away, `get_analysis_status` polls for the result.
+9. Records behavior findings against a function with a MITRE ATT&CK technique ID and a confidence level, persisted to a SQLite database so they survive a server restart instead of only living in conversation.
 
 ## Architecture
 
@@ -51,6 +52,14 @@ MalwareBazaar API -> fetch_sample (Auth-Key header, AES zip extraction)
                             v
       search_functions_by_api(name) -> searches whatever's
       already been decompiled and cached
+                            |
+                            v
+      tag_mitre_technique(function, technique, summary, confidence)
+      -> writes a finding row to findings.db (SQLite)
+                            |
+                            v
+      get_findings(job_id) -> reads every finding back from
+      findings.db
 ```
 
 The isolation is the whole point here. A sample sits on disk as inert data, and the only thing that ever touches it is a container with no network access, disassembling it statically. It is never executed, on the host or in the container.
@@ -88,6 +97,8 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 | `get_strings(job_id)` | Extracted string constants |
 | `get_imports(job_id)` | Imported libraries |
 | `search_functions_by_api(job_id, api_name)` | Searches already-decompiled functions for calls to a given API |
+| `tag_mitre_technique(job_id, function_name, mitre_technique, behavior_summary, confidence)` | Records a finding for a function against a MITRE ATT&CK technique ID, persisted to SQLite |
+| `get_findings(job_id)` | Returns every recorded finding for a job from the findings database |
 | `ping()` | Connectivity check |
 
 ## Verified so far
@@ -100,6 +111,7 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 - Persistent Ghidra project storage, reopened later without re-running full analysis
 - On-demand, per-function decompilation via `DecompInterface`, called through a second Ghidra script (`DecompileOne.java`) that reopens the persisted project in `-process` mode
 - API-based function search over already-decompiled code
+- Persistent, SQLite-backed findings storage with MITRE ATT&CK technique tagging and confidence levels, tested against a server restart to confirm it actually survives one
 - A full end-to-end run against a real, live malware sample, see the worked example below
 
 ## Worked example
@@ -109,6 +121,8 @@ I ran `fetch_sample` and `run_static_analysis` against a sample tagged `dropped-
 Calling `decompile_function` on `entry` shows a loop polling `GetClipboardSequenceNumber()`, reading `CF_UNICODETEXT` clipboard content whenever it changes, and running that text through a heavily obfuscated pattern matcher (stack string XOR decoding plus vectorized character comparisons, which is a pretty classic anti-analysis technique). If the pattern matches, it calls `SetClipboardData` to overwrite the clipboard content. Calling `search_functions_by_api` for `SetClipboardData` correctly surfaces `entry` as the match.
 
 That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a copied wallet address, check the format, and silently swap in an attacker-controlled address before the victim pastes it into a transaction.
+
+I recorded that as a finding with `tag_mitre_technique`, tagging `entry` with `T1115` (Clipboard Data) and a high confidence level, along with a plain-language summary of the behavior. Calling `get_findings` afterward returned that exact record back from the database, with an auto-generated ID and timestamp, confirming it's actually persisted and not just sitting in memory.
 
 ## Screenshots
 
@@ -138,13 +152,14 @@ That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a 
 - **MalwareBazaar's AES encrypted zips.** Python's stdlib `zipfile` only supports the older ZipCrypto scheme, and MalwareBazaar's archives use WinZip AES, which raises `NotImplementedError`. Fixed by switching to `pyzipper.AESZipFile`.
 - **Persisting the Ghidra project across container runs.** The first version of this ran every analysis in a throwaway container filesystem, so the analyzed project vanished the moment the container exited, which meant only a single bulk decompile pass was possible. Fixed by bind-mounting a per-job host directory into the container as the project directory, so a later container can reopen it with `analyzeHeadless -process` instead of re-importing and re-analyzing from scratch.
 - **Command injection through a tool argument.** `decompile_function` takes a function name that ends up inside a shell command string. Added a strict allowlist regex (alphanumeric, underscore, dot, dollar only) that rejects anything else before it ever touches the command.
+- **Findings living only in conversation, not anywhere structured.** Early on, calling a function a "clipboard hijacker" was just something the AI said in chat, with nothing stored. Fixed by adding a SQLite-backed findings table and a `tag_mitre_technique` tool, so a finding is a real row with a function name, a MITRE technique ID, a confidence level, and a timestamp, queryable later with `get_findings` even after the server restarts.
 
 ## Limitations
 
 - No IDA Pro integration, despite how I originally framed the project. Ghidra headless alone has been enough so far.
 - String extraction is a straightforward walk over defined data with a string value. No entropy analysis, no separating out attacker-meaningful strings like C2 domains or mutex names from ordinary library boilerplate.
-- No MITRE ATT&CK tagging or findings database yet. Right now behavior classification (like calling this a clipboard hijacker) happens in conversation with the AI, not stored anywhere structured. That's the next piece I'm building.
-- No YARA rule generation or analyst report generation yet, also planned next.
+- MITRE ATT&CK tagging is manual: an agent (or a human) has to call `tag_mitre_technique` with the right technique ID, there's no automatic technique classification yet.
+- No YARA rule generation or analyst report generation yet, that's the next piece I'm building.
 
 ## Author
 
