@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import uuid
 import os
@@ -17,8 +18,16 @@ GHIDRA_IMAGE = "pseudolens-ghidra:latest"
 GHIDRA_HEADLESS = "/opt/ghidra_12.1.3_PUBLIC/support/analyzeHeadless"
 SCRIPTS_DIR = str(Path.home() / "pseudolens" / "scripts")
 OUTPUT_DIR = str(Path.home() / "pseudolens" / "output")
+PROJECTS_DIR = str(Path.home() / "pseudolens" / "projects")
 MALWAREBAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 SAMPLES_DIR = str(Path.home() / "pseudolens" / "samples")
+
+# Only allow safe characters in a function name before it ever touches a
+# shell command string. Ghidra function names are things like "entry" or
+# "FUN_180001350" so this is not a real limitation, and it closes off
+# command injection through a tool argument.
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.$]+$")
+
 
 @mcp.tool()
 def ping() -> str:
@@ -39,7 +48,9 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
         project_name = f"job_{job_id[:8]}"
         project_dir = "/work/project"
 
-        import os
+        host_project_dir = str(Path(PROJECTS_DIR) / job_id)
+        os.makedirs(host_project_dir, exist_ok=True)
+
         host_uid = os.getuid()
         host_gid = os.getgid()
 
@@ -51,10 +62,13 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
             f"-import /work/samples/{filename} -overwrite "
             f"-scriptPath /work/scripts -postScript ExtractInfo.java "
             f"/work/output/{job_id}.json && "
-            f"chown {host_uid}:{host_gid} /work/output/{job_id}.json"
+            f"chown -R {host_uid}:{host_gid} /work/output/{job_id}.json /work/project"
         )
         container_command = ["bash", "-c", cmd_str]
 
+        # project_dir is now bind-mounted to a host directory that survives
+        # after the container is removed, so decompile_function can reopen
+        # this same analyzed project later instead of starting over.
         raw_logs = client.containers.run(
             GHIDRA_IMAGE,
             command=container_command,
@@ -62,6 +76,7 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
                 host_sample_dir: {"bind": "/work/samples", "mode": "ro"},
                 SCRIPTS_DIR: {"bind": "/work/scripts", "mode": "ro"},
                 OUTPUT_DIR: {"bind": "/work/output", "mode": "rw"},
+                host_project_dir: {"bind": project_dir, "mode": "rw"},
             },
             network_mode="none",
             hostname="ghidra-analysis",
@@ -76,6 +91,10 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
                 parsed = json.load(f)
             jobs[job_id]["status"] = "done"
             jobs[job_id]["result"] = parsed
+            jobs[job_id]["project_name"] = project_name
+            jobs[job_id]["program_name"] = filename
+            jobs[job_id]["host_project_dir"] = host_project_dir
+            jobs[job_id]["decompiled_cache"] = {}
         else:
             output = raw_logs.decode("utf-8", errors="replace")
             jobs[job_id]["status"] = "failed"
@@ -88,7 +107,7 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
 
 @mcp.tool()
 def run_static_analysis(sample_id: str) -> str:
-    """Run real Ghidra headless static analysis on a sample file (absolute path on this VM). Returns a job_id to poll for results."""
+    """Run real Ghidra headless static analysis on a sample file (absolute path on this VM). Returns a job_id to poll for results. The analyzed Ghidra project is kept on disk afterward, so list_functions, decompile_function, get_strings, get_imports, and search_functions_by_api can all be called against this job_id once it's done."""
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "sample_id": sample_id, "result": None}
 
@@ -98,6 +117,7 @@ def run_static_analysis(sample_id: str) -> str:
     thread.start()
 
     return job_id
+
 
 @mcp.tool()
 def fetch_sample(sha256_hash: str) -> dict:
@@ -152,10 +172,135 @@ def fetch_sample(sha256_hash: str) -> dict:
         "local_path": local_path,
     }
 
+
 @mcp.tool()
 def get_analysis_status(job_id: str) -> dict:
     """Check the status/result of a previously started analysis job."""
     return jobs.get(job_id, {"status": "not_found"})
+
+
+@mcp.tool()
+def list_functions(job_id: str) -> dict:
+    """List every function Ghidra found in a completed analysis job, with name and entry address. Does not include decompiled code, call decompile_function for that on a specific function."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+
+    functions = job["result"].get("functions", [])
+    return {
+        "functions_found": job["result"].get("functions_found"),
+        "functions": [
+            {"name": f["name"], "entry": f["entry"]} for f in functions
+        ],
+    }
+
+
+@mcp.tool()
+def get_strings(job_id: str) -> dict:
+    """Get the extracted string constants from a completed analysis job."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+    return {"strings": job["result"].get("strings_sample", [])}
+
+
+@mcp.tool()
+def get_imports(job_id: str) -> dict:
+    """Get the imported libraries from a completed analysis job."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+    return {"imported_libraries": job["result"].get("imported_libraries", [])}
+
+
+@mcp.tool()
+def decompile_function(job_id: str, function_name: str) -> dict:
+    """Decompile a single function by name from a completed analysis job, on demand. Reopens the already-analyzed Ghidra project rather than re-running full analysis, so this is much faster than the initial run_static_analysis call. Results are cached, calling this again for the same function returns instantly."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+
+    if not SAFE_NAME_RE.match(function_name):
+        return {"error": "function_name contains characters that aren't allowed"}
+
+    cache = job.setdefault("decompiled_cache", {})
+    if function_name in cache:
+        return cache[function_name]
+
+    try:
+        client = docker.from_env()
+        host_uid = os.getuid()
+        host_gid = os.getgid()
+        out_name = f"{job_id}_{function_name}.json"
+
+        cmd_str = (
+            f"{GHIDRA_HEADLESS} /work/project {job['project_name']} "
+            f"-process {job['program_name']} -noanalysis "
+            f"-scriptPath /work/scripts -postScript DecompileOne.java "
+            f"{function_name} /work/output/{out_name} && "
+            f"chown {host_uid}:{host_gid} /work/output/{out_name}"
+        )
+        container_command = ["bash", "-c", cmd_str]
+
+        client.containers.run(
+            GHIDRA_IMAGE,
+            command=container_command,
+            volumes={
+                SCRIPTS_DIR: {"bind": "/work/scripts", "mode": "ro"},
+                OUTPUT_DIR: {"bind": "/work/output", "mode": "rw"},
+                job["host_project_dir"]: {"bind": "/work/project", "mode": "rw"},
+            },
+            network_mode="none",
+            hostname="ghidra-analysis",
+            extra_hosts={"ghidra-analysis": "127.0.0.1"},
+            remove=True,
+            stdout=True,
+            stderr=True,
+        )
+
+        out_path = Path(OUTPUT_DIR) / out_name
+        if not out_path.is_file():
+            return {"error": "decompile_function produced no output"}
+
+        with open(out_path) as f:
+            result = json.load(f)
+
+        cache[function_name] = result
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def search_functions_by_api(job_id: str, api_name: str) -> dict:
+    """Search already-decompiled functions in a job for calls to a given API name (e.g. CreateRemoteThread, GetClipboardData). Only searches functions that have already been decompiled via decompile_function or the initial analysis, call decompile_function on more functions first to widen the search."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+
+    cache = job.get("decompiled_cache", {})
+    matches = []
+    for name, result in cache.items():
+        code = result.get("decompiled", "")
+        if api_name in code:
+            matches.append(name)
+
+    return {
+        "api_name": api_name,
+        "matching_functions": matches,
+        "functions_searched": len(cache),
+        "note": "Only functions already decompiled were searched. Call decompile_function on more functions to widen coverage.",
+    }
 
 
 if __name__ == "__main__":

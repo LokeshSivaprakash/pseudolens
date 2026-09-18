@@ -5,3 +5,4 @@ samples/
 output/
 *.zip
 .env
+projects/
