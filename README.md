@@ -127,6 +127,9 @@ That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a 
 **Decompiled analysis result on a live malware sample**
 ![Analysis result](docs/screenshots/analysis-result.png)
 
+**Searching already-decompiled functions for a specific API call**
+![search_functions_by_api result](docs/screenshots/search-by-api.png)
+
 ## Problems I ran into building this
 
 - **Container DNS resolution under `--network none`.** Ghidra's logging setup calls `InetAddress.getLocalHost()`, which fails outright with no network stack in the container. Fixed with an explicit `hostname` plus an `extra_hosts` mapping so the lookup resolves locally instead of going out to DNS.
