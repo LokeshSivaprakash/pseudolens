@@ -133,6 +133,23 @@ clipboard hijacker**: wait for a copied wallet address, validate its format,
 silently replace it with an attacker-controlled address before the victim
 pastes it into a transaction.
 
+## Screenshots
+
+**MCP server connected**
+![Server connected](docs/screenshots/server-connected.png)
+
+**Tools registered**
+![Tools list](docs/screenshots/tools-list.png)
+
+**Fetching a real sample from MalwareBazaar**
+![fetch_sample result](docs/screenshots/fetch-sample.png)
+
+**Launching analysis, returns a job ID immediately (async pattern)**
+![run_static_analysis result](docs/screenshots/run-static-analysis.png)
+
+**Decompiled analysis result on a live malware sample**
+![Analysis result](docs/screenshots/analysis-result.png)
+
 ## Real problems solved while building this
 
 - **Container DNS resolution under `--network none`**: Ghidra's logging
