@@ -116,7 +116,7 @@ That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a 
 ![Server connected](docs/screenshots/server-connected.png)
 
 **Tools registered**
-![Tools list](docs/screenshots/tools-list.png)
+![Tools list](docs/screenshots/tool-list.png)
 
 **Fetching a real sample from MalwareBazaar**
 ![fetch_sample result](docs/screenshots/fetch-sample.png)
@@ -126,6 +126,9 @@ That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a 
 
 **Decompiled analysis result on a live malware sample**
 ![Analysis result](docs/screenshots/analysis-result.png)
+
+**Searching already-decompiled functions for a specific API call**
+![search_functions_by_api result](docs/screenshots/search-by-api.png)
 
 ## Problems I ran into building this
 
