@@ -6,3 +6,4 @@ output/
 *.zip
 .env
 projects/
+findings.db

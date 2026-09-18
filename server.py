@@ -1,10 +1,12 @@
 import json
 import re
+import sqlite3
 import threading
 import uuid
 import os
 import pyzipper
 import requests
+from datetime import datetime, timezone
 from pathlib import Path
 
 import docker
@@ -21,12 +23,40 @@ OUTPUT_DIR = str(Path.home() / "pseudolens" / "output")
 PROJECTS_DIR = str(Path.home() / "pseudolens" / "projects")
 MALWAREBAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 SAMPLES_DIR = str(Path.home() / "pseudolens" / "samples")
+DB_PATH = str(Path.home() / "pseudolens" / "findings.db")
 
 # Only allow safe characters in a function name before it ever touches a
 # shell command string. Ghidra function names are things like "entry" or
 # "FUN_180001350" so this is not a real limitation, and it closes off
 # command injection through a tool argument.
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.$]+$")
+
+ALLOWED_CONFIDENCE = {"low", "medium", "high"}
+
+
+def _init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                sample_path TEXT,
+                function_name TEXT NOT NULL,
+                behavior_summary TEXT NOT NULL,
+                mitre_technique TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_init_db()
 
 
 @mcp.tool()
@@ -301,6 +331,65 @@ def search_functions_by_api(job_id: str, api_name: str) -> dict:
         "functions_searched": len(cache),
         "note": "Only functions already decompiled were searched. Call decompile_function on more functions to widen coverage.",
     }
+
+
+@mcp.tool()
+def tag_mitre_technique(
+    job_id: str,
+    function_name: str,
+    mitre_technique: str,
+    behavior_summary: str,
+    confidence: str,
+) -> dict:
+    """Record a finding for a function: what it does, which MITRE ATT&CK technique it maps to (e.g. T1115 for clipboard data), and how confident the analysis is. Writes to a persistent SQLite findings database so classifications survive after this job's in-memory state is gone. confidence must be one of low, medium, high."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+
+    if confidence not in ALLOWED_CONFIDENCE:
+        return {"error": f"confidence must be one of {sorted(ALLOWED_CONFIDENCE)}"}
+
+    sample_path = job.get("sample_id")
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO findings
+                (job_id, sample_path, function_name, behavior_summary, mitre_technique, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, sample_path, function_name, behavior_summary, mitre_technique, confidence, created_at),
+        )
+        conn.commit()
+        finding_id = cur.lastrowid
+    finally:
+        conn.close()
+
+    return {
+        "finding_id": finding_id,
+        "job_id": job_id,
+        "function_name": function_name,
+        "mitre_technique": mitre_technique,
+        "confidence": confidence,
+        "created_at": created_at,
+    }
+
+
+@mcp.tool()
+def get_findings(job_id: str) -> dict:
+    """Get every recorded finding for a job from the persistent findings database."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM findings WHERE job_id = ? ORDER BY created_at", (job_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return {"job_id": job_id, "findings": [dict(row) for row in rows]}
 
 
 if __name__ == "__main__":
