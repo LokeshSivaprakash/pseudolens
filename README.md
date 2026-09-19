@@ -146,7 +146,7 @@ That's a real, syntactically valid YARA rule generated from actual sample data a
 ![Server connected](docs/screenshots/server-connected.png)
 
 **Tools registered**
-![Tools list](docs/screenshots/tools-list.png)
+![Tools list](docs/screenshots/tool-list.png)
 
 **Fetching a real sample from MalwareBazaar**
 ![fetch_sample result](docs/screenshots/fetch-sample.png)
