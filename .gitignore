@@ -8,3 +8,4 @@ output/
 projects/
 findings.db
 yara_rules/
+reports/

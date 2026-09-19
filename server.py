@@ -26,6 +26,7 @@ MALWAREBAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 SAMPLES_DIR = str(Path.home() / "pseudolens" / "samples")
 DB_PATH = str(Path.home() / "pseudolens" / "findings.db")
 YARA_DIR = str(Path.home() / "pseudolens" / "yara_rules")
+REPORTS_DIR = str(Path.home() / "pseudolens" / "reports")
 
 # Only allow safe characters in a function name before it ever touches a
 # shell command string. Ghidra function names are things like "entry" or
@@ -492,7 +493,7 @@ def draft_yara_rule(job_id: str, rule_name: str = "") -> dict:
     with open(out_path, "w") as f:
         f.write(rule_text)
 
-    return {
+    yara_draft = {
         "rule_name": safe_name,
         "rule_path": str(out_path),
         "strings_used": picked_strings,
@@ -500,6 +501,119 @@ def draft_yara_rule(job_id: str, rule_name: str = "") -> dict:
         "mitre_techniques": techniques,
         "findings_used": len(findings),
         "rule_text": rule_text,
+    }
+    # Cached on the job so generate_report can pick up the most recently
+    # drafted rule for this job without having to guess a filename.
+    job["yara_draft"] = yara_draft
+    return yara_draft
+
+
+@mcp.tool()
+def generate_report(job_id: str) -> dict:
+    """Generate a Markdown analyst report for a completed analysis job, pulling together sample metadata, every recorded finding (from tag_mitre_technique), and the most recently drafted YARA rule (from draft_yara_rule) if one exists. This is a draft report assembled from what's actually been recorded so far, not an automated verdict -- a human analyst should review it, and any function not yet covered by a finding is called out as such rather than guessed at."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+
+    result = job["result"]
+    sample_path = job.get("sample_id")
+    program_name = job.get("program_name", "unknown")
+    functions_found = result.get("functions_found")
+    imported_libraries = result.get("imported_libraries", [])
+
+    sha256 = None
+    if sample_path and Path(sample_path).is_file():
+        sha256 = hashlib.sha256(Path(sample_path).read_bytes()).hexdigest()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM findings WHERE job_id = ? ORDER BY created_at", (job_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    findings = [dict(r) for r in rows]
+
+    decompiled_names = sorted(job.get("decompiled_cache", {}).keys())
+    yara_draft = job.get("yara_draft")
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    lines = []
+    lines.append(f"# PseudoLens Analyst Report")
+    lines.append("")
+    lines.append(f"*Draft report, generated {generated_at}. Reviewed and finalized by a human analyst before use.*")
+    lines.append("")
+    lines.append("## Sample")
+    lines.append("")
+    lines.append(f"- **File:** `{program_name}`")
+    lines.append(f"- **SHA256:** `{sha256 or 'unknown'}`")
+    lines.append(f"- **Functions found:** {functions_found}")
+    lines.append(f"- **Imported libraries:** {', '.join(imported_libraries) if imported_libraries else 'none recorded'}")
+    lines.append(f"- **Job ID:** `{job_id}`")
+    lines.append("")
+    lines.append("## Findings")
+    lines.append("")
+    if findings:
+        lines.append("| Function | MITRE ATT&CK | Confidence | Summary | Recorded |")
+        lines.append("|---|---|---|---|---|")
+        for f in findings:
+            summary = f["behavior_summary"].replace("|", "\\|")
+            lines.append(
+                f"| `{f['function_name']}` | {f['mitre_technique']} | {f['confidence']} "
+                f"| {summary} | {f['created_at']} |"
+            )
+    else:
+        lines.append("No findings recorded yet for this job. Call `tag_mitre_technique` on the functions of interest before finalizing this report.")
+    lines.append("")
+    lines.append("## Functions decompiled")
+    lines.append("")
+    if decompiled_names:
+        lines.append("The following functions were decompiled and reviewed during this analysis:")
+        lines.append("")
+        for name in decompiled_names:
+            lines.append(f"- `{name}`")
+    else:
+        lines.append("No functions have been decompiled yet in this job.")
+    lines.append("")
+    lines.append("## Detection")
+    lines.append("")
+    if yara_draft:
+        lines.append(f"A draft YARA rule (`{yara_draft['rule_name']}`) was generated from this sample's distinctive strings"
+                      f"{' and its recorded findings' if yara_draft['findings_used'] else ''}."
+                      " This is a starting point, not a validated rule -- test it against a broader sample set before deploying it.")
+        lines.append("")
+        lines.append("```yara")
+        lines.append(yara_draft["rule_text"].rstrip())
+        lines.append("```")
+    else:
+        lines.append("No YARA rule has been drafted yet for this job. Call `draft_yara_rule` to generate one.")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("")
+    lines.append("This report was assembled automatically from tool calls made during this session (fetch_sample, "
+                  "run_static_analysis, decompile_function, tag_mitre_technique, draft_yara_rule). Nothing in it "
+                  "reflects code execution -- all analysis was static, performed inside an isolated, network-disabled "
+                  "container. MITRE ATT&CK technique assignments and confidence levels were entered manually via "
+                  "tag_mitre_technique and have not been independently verified beyond what's shown above.")
+
+    report_text = "\n".join(lines) + "\n"
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    out_path = Path(REPORTS_DIR) / f"{job_id[:8]}_report.md"
+    with open(out_path, "w") as f:
+        f.write(report_text)
+
+    return {
+        "report_path": str(out_path),
+        "job_id": job_id,
+        "findings_included": len(findings),
+        "functions_decompiled": len(decompiled_names),
+        "yara_rule_included": bool(yara_draft),
+        "report_text": report_text,
     }
 
 
