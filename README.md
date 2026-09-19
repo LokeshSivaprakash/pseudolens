@@ -4,7 +4,7 @@ An MCP server that wraps isolated, headless Ghidra static analysis as callable t
 
 I built this because reverse engineering usually means opening a sample in Ghidra or IDA, manually reading disassembly, and cross referencing imports and strings by hand. There's no structured way for an AI agent to participate in that process, since there's no interface between "here's a binary" and "here's what it does." PseudoLens is that interface: an MCP server (Model Context Protocol) that wraps a real Ghidra headless pipeline as a set of tools an agent can call directly, one function at a time rather than getting one giant blob dumped all at once.
 
-The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior, then recorded that finding as a structured, MITRE ATT&CK-tagged record instead of just leaving it in conversation. See the worked example below.
+The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior, recorded that finding as a structured, MITRE ATT&CK-tagged record, and drafted a YARA rule from real signals in the sample that I then validated with the actual `yara` CLI. See the worked example below.
 
 ## What it does
 
@@ -17,6 +17,7 @@ The core pipeline works end to end. I've run it against a live sample pulled fro
 7. Lets you search whatever's already been decompiled for calls to a specific API, useful for questions like "which functions call CreateRemoteThread."
 8. Runs the initial analysis as an async job so a long running task doesn't block the calling agent. `run_static_analysis` returns a job ID right away, `get_analysis_status` polls for the result.
 9. Records behavior findings against a function with a MITRE ATT&CK technique ID and a confidence level, persisted to a SQLite database so they survive a server restart instead of only living in conversation.
+10. Drafts a YARA detection rule from a completed job's distinctive strings and any recorded findings, writing an actual `.yar` file with meta, strings, and a condition block. This is a starting draft built from real signals, not a validated rule, a human analyst should review and test it before using it for detection.
 
 ## Architecture
 
@@ -60,6 +61,10 @@ MalwareBazaar API -> fetch_sample (Auth-Key header, AES zip extraction)
                             v
       get_findings(job_id) -> reads every finding back from
       findings.db
+                            |
+                            v
+      draft_yara_rule(job_id) -> picks distinctive strings +
+      findings for the job, writes a .yar file to yara_rules/
 ```
 
 The isolation is the whole point here. A sample sits on disk as inert data, and the only thing that ever touches it is a container with no network access, disassembling it statically. It is never executed, on the host or in the container.
@@ -99,6 +104,7 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 | `search_functions_by_api(job_id, api_name)` | Searches already-decompiled functions for calls to a given API |
 | `tag_mitre_technique(job_id, function_name, mitre_technique, behavior_summary, confidence)` | Records a finding for a function against a MITRE ATT&CK technique ID, persisted to SQLite |
 | `get_findings(job_id)` | Returns every recorded finding for a job from the findings database |
+| `draft_yara_rule(job_id, rule_name)` | Drafts a YARA rule from a job's distinctive strings and recorded findings, writes a `.yar` file |
 | `ping()` | Connectivity check |
 
 ## Verified so far
@@ -112,6 +118,7 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 - On-demand, per-function decompilation via `DecompInterface`, called through a second Ghidra script (`DecompileOne.java`) that reopens the persisted project in `-process` mode
 - API-based function search over already-decompiled code
 - Persistent, SQLite-backed findings storage with MITRE ATT&CK technique tagging and confidence levels, tested against a server restart to confirm it actually survives one
+- YARA rule drafting from real extracted strings and findings, with the generated rule verified against the real `yara` CLI, it compiles and correctly matches the sample it was drafted from
 - A full end-to-end run against a real, live malware sample, see the worked example below
 
 ## Worked example
@@ -123,6 +130,15 @@ Calling `decompile_function` on `entry` shows a loop polling `GetClipboardSequen
 That's the standard behavior of a cryptocurrency clipboard hijacker: wait for a copied wallet address, check the format, and silently swap in an attacker-controlled address before the victim pastes it into a transaction.
 
 I recorded that as a finding with `tag_mitre_technique`, tagging `entry` with `T1115` (Clipboard Data) and a high confidence level, along with a plain-language summary of the behavior. Calling `get_findings` afterward returned that exact record back from the database, with an auto-generated ID and timestamp, confirming it's actually persisted and not just sitting in memory.
+
+Then I called `draft_yara_rule` on the same job. It picked out eight distinctive strings from the sample's clipboard-related API imports (`GlobalAlloc`, `GetClipboardData`, `EmptyClipboard`, and so on, filtering out generic library noise), pulled in the `T1115` finding for the rule's metadata, computed the sample's real SHA256, and wrote a complete `.yar` file requiring at least four of those eight strings to match. I installed the actual `yara` command line tool and ran the generated rule against the sample it came from, and it compiled and matched correctly:
+
+```
+$ yara yara_rules/PseudoLens_c46952fa.yar samples/e012af.../e012af....exe
+PseudoLens_c46952fa /home/analyst/pseudolens/samples/e012af.../e012af....exe
+```
+
+That's a real, syntactically valid YARA rule generated from actual sample data and confirmed against a real YARA engine, not just a plausible-looking string.
 
 ## Screenshots
 
@@ -153,13 +169,15 @@ I recorded that as a finding with `tag_mitre_technique`, tagging `entry` with `T
 - **Persisting the Ghidra project across container runs.** The first version of this ran every analysis in a throwaway container filesystem, so the analyzed project vanished the moment the container exited, which meant only a single bulk decompile pass was possible. Fixed by bind-mounting a per-job host directory into the container as the project directory, so a later container can reopen it with `analyzeHeadless -process` instead of re-importing and re-analyzing from scratch.
 - **Command injection through a tool argument.** `decompile_function` takes a function name that ends up inside a shell command string. Added a strict allowlist regex (alphanumeric, underscore, dot, dollar only) that rejects anything else before it ever touches the command.
 - **Findings living only in conversation, not anywhere structured.** Early on, calling a function a "clipboard hijacker" was just something the AI said in chat, with nothing stored. Fixed by adding a SQLite-backed findings table and a `tag_mitre_technique` tool, so a finding is a real row with a function name, a MITRE technique ID, a confidence level, and a timestamp, queryable later with `get_findings` even after the server restarts.
+- **Generic strings drowning out real signal in a YARA rule.** A naive rule built from the first N extracted strings mostly pulled in glibc version tags and boilerplate that show up in nearly every binary, which would make the rule match almost anything. Fixed by filtering candidate strings against a noise pattern (GLIBC versions, common libc symbol prefixes, terminal config boilerplate) before picking which ones go into the rule.
 
 ## Limitations
 
 - No IDA Pro integration, despite how I originally framed the project. Ghidra headless alone has been enough so far.
 - String extraction is a straightforward walk over defined data with a string value. No entropy analysis, no separating out attacker-meaningful strings like C2 domains or mutex names from ordinary library boilerplate.
 - MITRE ATT&CK tagging is manual: an agent (or a human) has to call `tag_mitre_technique` with the right technique ID, there's no automatic technique classification yet.
-- No YARA rule generation or analyst report generation yet, that's the next piece I'm building.
+- YARA rules are drafted from string presence alone, no byte patterns, no PE/ELF-format-aware conditions, no opcode signatures. Good enough as a starting point, not a substitute for a human tuning the rule against a broader sample set.
+- No analyst report generation yet, that's the next piece I'm building.
 
 ## Author
 
