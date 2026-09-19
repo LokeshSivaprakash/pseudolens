@@ -7,3 +7,4 @@ output/
 .env
 projects/
 findings.db
+yara_rules/

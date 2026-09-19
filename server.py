@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sqlite3
@@ -24,14 +25,23 @@ PROJECTS_DIR = str(Path.home() / "pseudolens" / "projects")
 MALWAREBAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 SAMPLES_DIR = str(Path.home() / "pseudolens" / "samples")
 DB_PATH = str(Path.home() / "pseudolens" / "findings.db")
+YARA_DIR = str(Path.home() / "pseudolens" / "yara_rules")
 
 # Only allow safe characters in a function name before it ever touches a
 # shell command string. Ghidra function names are things like "entry" or
 # "FUN_180001350" so this is not a real limitation, and it closes off
 # command injection through a tool argument.
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.$]+$")
-
 ALLOWED_CONFIDENCE = {"low", "medium", "high"}
+
+# Strings that show up in almost every binary linked against glibc/libselinux
+# etc, useless as detection signatures. Filtered out before drafting a YARA
+# rule so the rule is built from strings that are actually distinctive to
+# this sample.
+STRING_NOISE_RE = re.compile(
+    r"^(GLIBC_|LIBSELINUX|LIBC\.|TERM |COLORTERM|#|/lib64/|_ITM_|__|"
+    r"program_invocation|error_|optind|optarg)"
+)
 
 
 def _init_db() -> None:
@@ -96,9 +106,6 @@ def _run_ghidra_analysis(job_id: str, sample_path: str) -> None:
         )
         container_command = ["bash", "-c", cmd_str]
 
-        # project_dir is now bind-mounted to a host directory that survives
-        # after the container is removed, so decompile_function can reopen
-        # this same analyzed project later instead of starting over.
         raw_logs = client.containers.run(
             GHIDRA_IMAGE,
             command=container_command,
@@ -341,11 +348,10 @@ def tag_mitre_technique(
     behavior_summary: str,
     confidence: str,
 ) -> dict:
-    """Record a finding for a function: what it does, which MITRE ATT&CK technique it maps to (e.g. T1115 for clipboard data), and how confident the analysis is. Writes to a persistent SQLite findings database so classifications survive after this job's in-memory state is gone. confidence must be one of low, medium, high."""
+    """Record a finding for a function in a completed analysis job: what it does (behavior_summary), which MITRE ATT&CK technique ID it maps to (e.g. T1115), and how confident you are (low, medium, or high). Persisted to a SQLite database so it survives a server restart, unlike the in-memory job store."""
     job = jobs.get(job_id)
     if not job:
         return {"error": "job not found"}
-
     if confidence not in ALLOWED_CONFIDENCE:
         return {"error": f"confidence must be one of {sorted(ALLOWED_CONFIDENCE)}"}
 
@@ -390,6 +396,111 @@ def get_findings(job_id: str) -> dict:
         conn.close()
 
     return {"job_id": job_id, "findings": [dict(row) for row in rows]}
+
+
+def _pick_yara_strings(strings: list, max_count: int = 8, min_len: int = 8, max_len: int = 80) -> list:
+    """Pick a handful of distinctive strings to use as YARA signature strings.
+    Filters out short strings, overly long ones, and common library/glibc
+    noise that shows up in almost every binary and would make the rule
+    match everything instead of this sample specifically."""
+    seen = set()
+    picked = []
+    for s in strings:
+        if not (min_len <= len(s) <= max_len):
+            continue
+        if STRING_NOISE_RE.match(s):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        picked.append(s)
+        if len(picked) >= max_count:
+            break
+    return picked
+
+
+def _yara_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+@mcp.tool()
+def draft_yara_rule(job_id: str, rule_name: str = "") -> dict:
+    """Draft a YARA rule from a completed analysis job's extracted strings and any findings recorded with tag_mitre_technique. This produces a starting draft built from real signals pulled out of the sample (strings, MITRE technique IDs, sample hash) -- it is not a validated detection rule, and a human analyst should review and test it before using it for real detection. Writes the rule to a .yar file and also returns its text."""
+    job = jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}
+    if job.get("status") != "done":
+        return {"error": f"job is not done yet, status: {job.get('status')}"}
+
+    strings = job["result"].get("strings_sample", [])
+    picked_strings = _pick_yara_strings(strings)
+    if not picked_strings:
+        return {"error": "no distinctive strings found in this sample to build a rule from"}
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM findings WHERE job_id = ? ORDER BY created_at", (job_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    findings = [dict(r) for r in rows]
+
+    techniques = sorted({f["mitre_technique"] for f in findings})
+    summaries = [f["behavior_summary"] for f in findings]
+
+    sample_path = job.get("sample_id")
+    sha256 = None
+    if sample_path and Path(sample_path).is_file():
+        sha256 = hashlib.sha256(Path(sample_path).read_bytes()).hexdigest()
+
+    safe_name = rule_name.strip() or f"PseudoLens_{job_id[:8]}"
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", safe_name)
+    if safe_name[0].isdigit():
+        safe_name = f"_{safe_name}"
+
+    string_defs = "\n".join(
+        f'        $s{i} = "{_yara_escape(s)}" ascii wide'
+        for i, s in enumerate(picked_strings)
+    )
+    threshold = max(2, len(picked_strings) // 2)
+
+    description = _yara_escape(summaries[0]) if summaries else "Behavior not yet tagged with tag_mitre_technique"
+    technique_line = ", ".join(techniques) if techniques else "none tagged yet"
+
+    rule_text = (
+        f"rule {safe_name}\n"
+        f"{{\n"
+        f"    meta:\n"
+        f'        author = "PseudoLens (draft, human review required)"\n'
+        f'        description = "{description}"\n'
+        f'        mitre_att_ck = "{technique_line}"\n'
+        f'        sha256 = "{sha256 or "unknown"}"\n'
+        f'        job_id = "{job_id}"\n'
+        f"\n"
+        f"    strings:\n"
+        f"{string_defs}\n"
+        f"\n"
+        f"    condition:\n"
+        f"        {threshold} of them\n"
+        f"}}\n"
+    )
+
+    os.makedirs(YARA_DIR, exist_ok=True)
+    out_path = Path(YARA_DIR) / f"{safe_name}.yar"
+    with open(out_path, "w") as f:
+        f.write(rule_text)
+
+    return {
+        "rule_name": safe_name,
+        "rule_path": str(out_path),
+        "strings_used": picked_strings,
+        "match_threshold": threshold,
+        "mitre_techniques": techniques,
+        "findings_used": len(findings),
+        "rule_text": rule_text,
+    }
 
 
 if __name__ == "__main__":
