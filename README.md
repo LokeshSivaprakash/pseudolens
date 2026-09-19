@@ -4,7 +4,7 @@ An MCP server that wraps isolated, headless Ghidra static analysis as callable t
 
 I built this because reverse engineering usually means opening a sample in Ghidra or IDA, manually reading disassembly, and cross referencing imports and strings by hand. There's no structured way for an AI agent to participate in that process, since there's no interface between "here's a binary" and "here's what it does." PseudoLens is that interface: an MCP server (Model Context Protocol) that wraps a real Ghidra headless pipeline as a set of tools an agent can call directly, one function at a time rather than getting one giant blob dumped all at once.
 
-The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior, recorded that finding as a structured, MITRE ATT&CK-tagged record, and drafted a YARA rule from real signals in the sample that I then validated with the actual `yara` CLI. See the worked example below.
+The core pipeline works end to end. I've run it against a live sample pulled from MalwareBazaar and it correctly extracted decompiled logic, imports, and strings that identified the sample's actual behavior, recorded that finding as a structured, MITRE ATT&CK-tagged record, drafted a YARA rule from real signals in the sample that I then validated with the actual `yara` CLI, and pulled everything together into a Markdown analyst report. See the worked example below.
 
 ## What it does
 
@@ -18,6 +18,7 @@ The core pipeline works end to end. I've run it against a live sample pulled fro
 8. Runs the initial analysis as an async job so a long running task doesn't block the calling agent. `run_static_analysis` returns a job ID right away, `get_analysis_status` polls for the result.
 9. Records behavior findings against a function with a MITRE ATT&CK technique ID and a confidence level, persisted to a SQLite database so they survive a server restart instead of only living in conversation.
 10. Drafts a YARA detection rule from a completed job's distinctive strings and any recorded findings, writing an actual `.yar` file with meta, strings, and a condition block. This is a starting draft built from real signals, not a validated rule, a human analyst should review and test it before using it for detection.
+11. Generates a Markdown analyst report for a job, pulling together the sample's metadata, every recorded finding, the functions that were decompiled, and the most recently drafted YARA rule into one document. If something hasn't been done yet (no findings tagged, no rule drafted), the report says so instead of making anything up.
 
 ## Architecture
 
@@ -65,6 +66,11 @@ MalwareBazaar API -> fetch_sample (Auth-Key header, AES zip extraction)
                             v
       draft_yara_rule(job_id) -> picks distinctive strings +
       findings for the job, writes a .yar file to yara_rules/
+                            |
+                            v
+      generate_report(job_id) -> pulls sample metadata, findings,
+      decompiled functions, and the drafted YARA rule together
+      into a Markdown report under reports/
 ```
 
 The isolation is the whole point here. A sample sits on disk as inert data, and the only thing that ever touches it is a container with no network access, disassembling it statically. It is never executed, on the host or in the container.
@@ -105,6 +111,7 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 | `tag_mitre_technique(job_id, function_name, mitre_technique, behavior_summary, confidence)` | Records a finding for a function against a MITRE ATT&CK technique ID, persisted to SQLite |
 | `get_findings(job_id)` | Returns every recorded finding for a job from the findings database |
 | `draft_yara_rule(job_id, rule_name)` | Drafts a YARA rule from a job's distinctive strings and recorded findings, writes a `.yar` file |
+| `generate_report(job_id)` | Generates a Markdown analyst report combining sample metadata, findings, decompiled functions, and the drafted YARA rule |
 | `ping()` | Connectivity check |
 
 ## Verified so far
@@ -119,6 +126,7 @@ npx @modelcontextprotocol/inspector -e MALWAREBAZAAR_AUTH_KEY=$MALWAREBAZAAR_AUT
 - API-based function search over already-decompiled code
 - Persistent, SQLite-backed findings storage with MITRE ATT&CK technique tagging and confidence levels, tested against a server restart to confirm it actually survives one
 - YARA rule drafting from real extracted strings and findings, with the generated rule verified against the real `yara` CLI, it compiles and correctly matches the sample it was drafted from
+- Markdown analyst report generation, pulling together sample metadata, findings, decompiled functions, and the drafted YARA rule into one document, tested end to end against a real job
 - A full end-to-end run against a real, live malware sample, see the worked example below
 
 ## Worked example
@@ -139,6 +147,8 @@ PseudoLens_c46952fa /home/analyst/pseudolens/samples/e012af.../e012af....exe
 ```
 
 That's a real, syntactically valid YARA rule generated from actual sample data and confirmed against a real YARA engine, not just a plausible-looking string.
+
+Finally I called `generate_report` on the same job. It produced a Markdown file with the sample's hash and imports, a findings table with the `T1115` entry, a list of the functions I'd decompiled, and the full drafted YARA rule embedded as a code block, plus a notes section stating plainly that everything was static analysis, that the MITRE tag was entered manually, and that a human should review it before treating it as final. That's the whole pipeline end to end: fetch a real sample, analyze it in isolation, decompile and tag what it does, draft a detection rule, and hand off a document a human analyst could actually read.
 
 ## Screenshots
 
@@ -170,6 +180,7 @@ That's a real, syntactically valid YARA rule generated from actual sample data a
 - **Command injection through a tool argument.** `decompile_function` takes a function name that ends up inside a shell command string. Added a strict allowlist regex (alphanumeric, underscore, dot, dollar only) that rejects anything else before it ever touches the command.
 - **Findings living only in conversation, not anywhere structured.** Early on, calling a function a "clipboard hijacker" was just something the AI said in chat, with nothing stored. Fixed by adding a SQLite-backed findings table and a `tag_mitre_technique` tool, so a finding is a real row with a function name, a MITRE technique ID, a confidence level, and a timestamp, queryable later with `get_findings` even after the server restarts.
 - **Generic strings drowning out real signal in a YARA rule.** A naive rule built from the first N extracted strings mostly pulled in glibc version tags and boilerplate that show up in nearly every binary, which would make the rule match almost anything. Fixed by filtering candidate strings against a noise pattern (GLIBC versions, common libc symbol prefixes, terminal config boilerplate) before picking which ones go into the rule.
+- **Losing track of the most recently drafted YARA rule for a report.** `generate_report` needs to reference the YARA rule for its job, but rules are written to disk under a name the caller chooses, not something derivable from the job ID alone. Fixed by caching the drafted rule onto the in-memory job record itself when `draft_yara_rule` runs, the same pattern already used for cached decompiled functions.
 
 ## Limitations
 
@@ -177,7 +188,7 @@ That's a real, syntactically valid YARA rule generated from actual sample data a
 - String extraction is a straightforward walk over defined data with a string value. No entropy analysis, no separating out attacker-meaningful strings like C2 domains or mutex names from ordinary library boilerplate.
 - MITRE ATT&CK tagging is manual: an agent (or a human) has to call `tag_mitre_technique` with the right technique ID, there's no automatic technique classification yet.
 - YARA rules are drafted from string presence alone, no byte patterns, no PE/ELF-format-aware conditions, no opcode signatures. Good enough as a starting point, not a substitute for a human tuning the rule against a broader sample set.
-- No analyst report generation yet, that's the next piece I'm building.
+- `generate_report` only pulls in the single most recently drafted YARA rule for a job, not every rule ever drafted for it, since only the latest one is cached on the job record.
 
 ## Author
 
